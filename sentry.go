@@ -7,6 +7,8 @@ import (
 	"github.com/getsentry/raven-go"
 )
 
+const SentryFingerprintKey = "_sentry_fingerprint"
+
 // ConsumePanic is intended to be called inside a deferred function when recovering
 // from a panic. It accepts the value of recover() as its only argument,
 // and reports the panic to Sentry, prints the stack,  and then repanics (to ensure your program terminates)
@@ -71,6 +73,12 @@ func (s sentryHook) Fire(e *logrus.Entry) error {
 		p.Message = err.Error()
 	} else {
 		p.Message = e.Message
+	}
+
+	// allow log statements to set the fingerprint if they want to
+	if fingerprint, ok := e.Data[SentryFingerprintKey].([]string); ok {
+		p.Fingerprint = fingerprint
+		delete(e.Data, SentryFingerprintKey)
 	}
 
 	p.Extra = make(map[string]interface{}, len(e.Data)-1)

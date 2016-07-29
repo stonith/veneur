@@ -5,6 +5,7 @@ import (
 	"compress/zlib"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -263,7 +264,10 @@ func (s *Server) flushForward(wms []WorkerMetrics) {
 		// not a fatal error if we fail
 		// we'll just try to use the host as it was given to us
 		s.statsd.Count("forward.error_total", 1, []string{"cause:dns"}, 1.0)
-		s.logger.WithError(err).Warn("Could not re-resolve host for forward")
+		s.logger.WithFields(logrus.Fields{
+			logrus.ErrorKey:      err,
+			SentryFingerprintKey: []string{"postHelper", "forward", "infra"},
+		}).Warn("Could not re-resolve host for forward")
 	}
 	s.statsd.TimeInMilliseconds("forward.duration_ns", float64(time.Now().Sub(dnsStart).Nanoseconds()), []string{"part:dns"}, 1.0)
 
@@ -359,6 +363,13 @@ func (s *Server) flushEventsChecks() {
 func (s *Server) postHelper(endpoint string, bodyObject interface{}, action string, compress bool) error {
 	// attach this field to all the logs we generate
 	innerLogger := s.logger.WithField("action", action)
+	// generate the initial sentry fingerprint for errors we generate
+	// our sentry fingerprints fall into roughly 3 categories:
+	// - programmer errors ("programmer")
+	// - infrastructural issues between us and the endpoint ("infra")
+	// - problems returned by the target endpoint ("target")
+	sentryFingerprint := make([]string, 0, 3)
+	sentryFingerprint = append(sentryFingerprint, "postHelper", action)
 
 	marshalStart := time.Now()
 	var (
@@ -374,14 +385,20 @@ func (s *Server) postHelper(endpoint string, bodyObject interface{}, action stri
 	}
 	if err := encoder.Encode(bodyObject); err != nil {
 		s.statsd.Count(action+".error_total", 1, []string{"cause:json"}, 1.0)
-		innerLogger.WithError(err).Error("Could not render JSON")
+		innerLogger.WithFields(logrus.Fields{
+			logrus.ErrorKey:      err,
+			SentryFingerprintKey: append(sentryFingerprint, "programmer"),
+		}).Error("Could not render JSON")
 		return err
 	}
 	if compress {
 		// don't forget to flush leftover compressed bytes to the buffer
 		if err := compressor.Close(); err != nil {
 			s.statsd.Count(action+".error_total", 1, []string{"cause:compress"}, 1.0)
-			innerLogger.WithError(err).Error("Could not finalize compression")
+			innerLogger.WithFields(logrus.Fields{
+				logrus.ErrorKey:      err,
+				SentryFingerprintKey: append(sentryFingerprint, "programmer"),
+			}).Error("Could not finalize compression")
 			return err
 		}
 	}
@@ -395,7 +412,10 @@ func (s *Server) postHelper(endpoint string, bodyObject interface{}, action stri
 	req, err := http.NewRequest(http.MethodPost, endpoint, &bodyBuffer)
 	if err != nil {
 		s.statsd.Count(action+".error_total", 1, []string{"cause:construct"}, 1.0)
-		innerLogger.WithError(err).Error("Could not construct request")
+		innerLogger.WithFields(logrus.Fields{
+			logrus.ErrorKey:      err,
+			SentryFingerprintKey: append(sentryFingerprint, "programmer"),
+		}).Error("Could not construct request")
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -413,8 +433,23 @@ func (s *Server) postHelper(endpoint string, bodyObject interface{}, action stri
 			// and ditch the url (which might contain secrets)
 			err = urlErr.Err
 		}
+		if err == io.EOF {
+			sentryFingerprint = append(sentryFingerprint, "infra")
+		} else {
+			switch err.(type) {
+			case *net.DNSError, *net.DNSConfigError:
+				// dns resolution problems
+				sentryFingerprint = append(sentryFingerprint, "infra")
+			default:
+				// most of these are timeouts
+				sentryFingerprint = append(sentryFingerprint, "target")
+			}
+		}
 		s.statsd.Count(action+".error_total", 1, []string{"cause:io"}, 1.0)
-		innerLogger.WithError(err).Error("Could not execute request")
+		innerLogger.WithFields(logrus.Fields{
+			logrus.ErrorKey:      err,
+			SentryFingerprintKey: sentryFingerprint,
+		}).Error("Could not execute request")
 		return err
 	}
 	s.statsd.TimeInMilliseconds(action+".duration_ns", float64(time.Now().Sub(requestStart).Nanoseconds()), []string{"part:post"}, 1.0)
@@ -425,7 +460,10 @@ func (s *Server) postHelper(endpoint string, bodyObject interface{}, action stri
 		// this error is not fatal, since we only need the body for reporting
 		// purposes
 		s.statsd.Count(action+".error_total", 1, []string{"cause:readresponse"}, 1.0)
-		innerLogger.WithError(err).Error("Could not read response body")
+		innerLogger.WithFields(logrus.Fields{
+			logrus.ErrorKey:      err,
+			SentryFingerprintKey: append(sentryFingerprint, "target"),
+		}).Error("Could not read response body")
 	}
 	resultLogger := innerLogger.WithFields(logrus.Fields{
 		"request_length":   bodyLength,
@@ -437,6 +475,11 @@ func (s *Server) postHelper(endpoint string, bodyObject interface{}, action stri
 
 	if resp.StatusCode != http.StatusAccepted {
 		s.statsd.Count(action+".error_total", 1, []string{fmt.Sprintf("cause:%d", resp.StatusCode)}, 1.0)
+		if resp.StatusCode < 500 {
+			resultLogger = resultLogger.WithField(SentryFingerprintKey, append(sentryFingerprint, "programmer"))
+		} else {
+			resultLogger = resultLogger.WithField(SentryFingerprintKey, append(sentryFingerprint, "target"))
+		}
 		resultLogger.Error("Could not POST")
 		return err
 	}
