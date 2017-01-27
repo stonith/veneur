@@ -2,9 +2,10 @@ package veneur
 
 import (
 	"errors"
-	"github.com/Sirupsen/logrus"
 	"testing"
 	"time"
+
+	"github.com/Sirupsen/logrus"
 
 	"github.com/getsentry/raven-go"
 )
@@ -14,14 +15,14 @@ func consumeAndCatchPanic(s *Server) (result interface{}) {
 	defer func() {
 		result = recover()
 	}()
-	s.ConsumePanic("panic")
+	ConsumePanic(s, "panic")
 	return
 }
 
 func TestConsumePanicWithoutSentry(t *testing.T) {
 	s := &Server{}
 	// does nothing
-	s.ConsumePanic(nil)
+	ConsumePanic(s, nil)
 
 	recovered := consumeAndCatchPanic(s)
 	if recovered != "panic" {
@@ -49,7 +50,7 @@ func TestConsumePanicWithSentry(t *testing.T) {
 	s.sentry.Transport = fakeTransport
 
 	// nil does nothing
-	s.ConsumePanic(nil)
+	ConsumePanic(s, nil)
 	if len(fakeTransport.packets) != 0 {
 		t.Error("ConsumePanic(nil) should not send data:", fakeTransport.packets)
 	}

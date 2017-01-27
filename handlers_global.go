@@ -22,95 +22,117 @@ func (ch contextHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ch(ctx, w, r)
 }
 
+func handleProxy(p *Proxy) http.Handler {
+	return contextHandler(func(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+		span, jsonMetrics, err := handleRequest(ctx, p, w, r)
+		// TODO Do something!
+		if err != nil {
+			return
+		}
+		// the server usually waits for this to return before finalizing the
+		// response, so this part must be done asynchronously
+		go p.ProxyMetrics(span.Attach(ctx), jsonMetrics)
+	})
+}
+
 // handleImport generates the handler that responds to POST requests submitting
 // metrics to the global veneur instance.
 func handleImport(s *Server) http.Handler {
 	return contextHandler(func(ctx context.Context, w http.ResponseWriter, r *http.Request) {
-		var (
-			jsonMetrics []samplers.JSONMetric
-			body        io.ReadCloser
-			err         error
-			encoding    = r.Header.Get("Content-Encoding")
-			span        *trace.Span
-		)
-
-		span, err = tracer.ExtractRequestChild("/import", r, "veneur.opentracing.import")
+		span, jsonMetrics, err := handleRequest(ctx, s, w, r)
+		// TODO Do something!
 		if err != nil {
-			log.WithError(err).Info("Could not extract span from request")
-			span = tracer.StartSpan("/import", trace.NameTag("veneur.opentracing.import")).(*trace.Span)
-		} else {
-			log.WithField("trace", span.Trace).Info("Extracted span from request")
-		}
-		defer span.Finish()
-
-		innerLogger := log.WithField("client", r.RemoteAddr)
-
-		switch encLogger := innerLogger.WithField("encoding", encoding); encoding {
-		case "":
-			body = r.Body
-			encoding = "identity"
-		case "deflate":
-			body, err = zlib.NewReader(r.Body)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				span.Error(err)
-				encLogger.WithError(err).Error("Could not read compressed request body")
-				s.statsd.Count("import.request_error_total", 1, []string{"cause:deflate"}, 1.0)
-				return
-			}
-			defer body.Close()
-		default:
-			http.Error(w, encoding, http.StatusUnsupportedMediaType)
-			span.Error(errors.New("Could not determine content-encoding of request"))
-			encLogger.Error("Could not determine content-encoding of request")
-			s.statsd.Count("import.request_error_total", 1, []string{"cause:unknown_content_encoding"}, 1.0)
 			return
 		}
-
-		if err = json.NewDecoder(body).Decode(&jsonMetrics); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			span.Error(err)
-			innerLogger.WithError(err).Error("Could not decode /import request")
-			s.statsd.Count("import.request_error_total", 1, []string{"cause:json"}, 1.0)
-			return
-		}
-
-		if len(jsonMetrics) == 0 {
-			const msg = "Received empty /import request"
-			http.Error(w, msg, http.StatusBadRequest)
-			span.Error(errors.New(msg))
-			innerLogger.WithError(err).Error(msg)
-			return
-		}
-
-		// We want to make sure we have at least one entry
-		// that is not empty (ie, all fields are the zero value)
-		// because that is usually the sign that we are unmarshalling
-		// into the wrong struct type
-
-		if !s.nonEmpty(span.Attach(ctx), jsonMetrics) {
-			const msg = "Received empty or improperly-formed metrics"
-			http.Error(w, msg, http.StatusBadRequest)
-			span.Error(errors.New(msg))
-			innerLogger.Error(msg)
-			return
-		}
-
-		w.WriteHeader(http.StatusAccepted)
-		s.statsd.TimeInMilliseconds("import.response_duration_ns",
-			float64(time.Since(span.Start).Nanoseconds()),
-			[]string{"part:request", fmt.Sprintf("encoding:%s", encoding)},
-			1.0)
-
 		// the server usually waits for this to return before finalizing the
 		// response, so this part must be done asynchronously
 		go s.ImportMetrics(span.Attach(ctx), jsonMetrics)
 	})
 }
 
+func handleRequest(ctx context.Context, s VeneurServer, w http.ResponseWriter, r *http.Request) (*trace.Span, []samplers.JSONMetric, error) {
+	var (
+		jsonMetrics []samplers.JSONMetric
+		body        io.ReadCloser
+		err         error
+		encoding    = r.Header.Get("Content-Encoding")
+		span        *trace.Span
+	)
+
+	span, err = tracer.ExtractRequestChild("/import", r, "veneur.opentracing.import")
+	if err != nil {
+		log.WithError(err).Info("Could not extract span from request")
+		span = tracer.StartSpan("/import", trace.NameTag("veneur.opentracing.import")).(*trace.Span)
+	} else {
+		log.WithField("trace", span.Trace).Info("Extracted span from request")
+	}
+	defer span.Finish()
+
+	innerLogger := log.WithField("client", r.RemoteAddr)
+
+	switch encLogger := innerLogger.WithField("encoding", encoding); encoding {
+	case "":
+		body = r.Body
+		encoding = "identity"
+	case "deflate":
+		body, err = zlib.NewReader(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			span.Error(err)
+			encLogger.WithError(err).Error("Could not read compressed request body")
+			s.GetStats().Count("import.request_error_total", 1, []string{"cause:deflate"}, 1.0)
+			return nil, nil, err
+		}
+		defer body.Close()
+	default:
+		http.Error(w, encoding, http.StatusUnsupportedMediaType)
+		span.Error(errors.New("Could not determine content-encoding of request"))
+		encLogger.Error("Could not determine content-encoding of request")
+		s.GetStats().Count("import.request_error_total", 1, []string{"cause:unknown_content_encoding"}, 1.0)
+		return nil, nil, err
+	}
+
+	if err = json.NewDecoder(body).Decode(&jsonMetrics); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		span.Error(err)
+		innerLogger.WithError(err).Error("Could not decode /import request")
+		s.GetStats().Count("import.request_error_total", 1, []string{"cause:json"}, 1.0)
+		return nil, nil, err
+	}
+
+	if len(jsonMetrics) == 0 {
+		const msg = "Received empty /import request"
+		http.Error(w, msg, http.StatusBadRequest)
+		span.Error(errors.New(msg))
+		innerLogger.WithError(err).Error(msg)
+		return nil, nil, err
+	}
+
+	// We want to make sure we have at least one entry
+	// that is not empty (ie, all fields are the zero value)
+	// because that is usually the sign that we are unmarshalling
+	// into the wrong struct type
+
+	if !nonEmpty(span.Attach(ctx), jsonMetrics) {
+		const msg = "Received empty or improperly-formed metrics"
+		http.Error(w, msg, http.StatusBadRequest)
+		span.Error(errors.New(msg))
+		innerLogger.Error(msg)
+		return nil, nil, err
+	}
+
+	w.WriteHeader(http.StatusAccepted)
+	s.GetStats().TimeInMilliseconds("import.response_duration_ns",
+		float64(time.Since(span.Start).Nanoseconds()),
+		[]string{"part:request", fmt.Sprintf("encoding:%s", encoding)},
+		1.0)
+
+	return span, jsonMetrics, nil
+}
+
 // nonEmpty returns true if there is at least one non-empty
 // metric
-func (s *Server) nonEmpty(ctx context.Context, jsonMetrics []samplers.JSONMetric) bool {
+func nonEmpty(ctx context.Context, jsonMetrics []samplers.JSONMetric) bool {
 
 	span, _ := trace.StartSpanFromContext(ctx, "/import", trace.NameTag("veneur.opentracing.import.nonEmpty"))
 	defer span.Finish()

@@ -13,7 +13,7 @@ var (
 )
 
 func init() {
-	trace.Service = "veneur"
+	trace.Service = "veneur-proxy"
 }
 
 func main() {
@@ -23,22 +23,20 @@ func main() {
 		logrus.Fatal("You must specify a config file")
 	}
 
-	conf, err := veneur.ReadConfig(*configFile)
+	conf, err := veneur.ReadProxyConfig(*configFile)
 	if err != nil {
 		logrus.WithError(err).Fatal("Error reading config file")
 	}
-	server, err := veneur.NewFromConfig(conf, nil)
+
+	proxy, err := veneur.NewProxyFromConfig(conf)
+
 	if err != nil {
-		logrus.WithError(err).Fatal("Could not initialize server")
+		logrus.WithError(err).Fatal("Could not initialize proxy")
 	}
 	defer func() {
-		veneur.ConsumePanic(&server, recover())
+		veneur.ConsumePanic(&proxy, recover())
 	}()
-	server.Start()
+	proxy.Start()
 
-	if conf.HTTPAddress != "" {
-		server.HTTPServe()
-	} else {
-		select {}
-	}
+	proxy.HTTPServe()
 }

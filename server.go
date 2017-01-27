@@ -41,6 +41,13 @@ var log = logrus.New()
 
 var tracer = trace.GlobalTracer
 
+type VeneurServer interface {
+	GetSentry() *raven.Client
+	GetHostname() string
+	GetStats() *statsd.Client
+	GetHTTPClient() *http.Client
+}
+
 // A Server is the actual veneur instance that will be run.
 type Server struct {
 	Workers     []*Worker
@@ -58,8 +65,10 @@ type Server struct {
 	DDTraceAddress string
 	HTTPClient     *http.Client
 
-	HTTPAddr    string
+	HTTPAddr string
+
 	ForwardAddr string
+
 	UDPAddr     *net.UDPAddr
 	TraceAddr   *net.UDPAddr
 	RcvbufBytes int
@@ -80,7 +89,7 @@ type Server struct {
 }
 
 // NewFromConfig creates a new veneur server from a configuration specification.
-func NewFromConfig(conf Config) (ret Server, err error) {
+func NewFromConfig(conf Config, transport http.RoundTripper) (ret Server, err error) {
 	ret.Hostname = conf.Hostname
 	ret.Tags = conf.Tags
 	ret.DDHostname = conf.APIHostname
@@ -98,15 +107,17 @@ func NewFromConfig(conf Config) (ret Server, err error) {
 		ret.HistogramAggregates.Count = len(conf.Aggregates)
 	}
 
-	interval, err := time.ParseDuration(conf.Interval)
+	ret.interval, err = time.ParseDuration(conf.Interval)
 	if err != nil {
 		return
 	}
-	ret.interval = interval
 	ret.HTTPClient = &http.Client{
 		// make sure that POSTs to datadog do not overflow the flush interval
-		Timeout: interval * 9 / 10,
+		Timeout: ret.interval * 9 / 10,
 		// we're fine with using the default transport and redirect behavior
+	}
+	if transport != nil {
+		ret.HTTPClient.Transport = transport
 	}
 	ret.FlushMaxPerBody = conf.FlushMaxPerBody
 
@@ -155,7 +166,7 @@ func NewFromConfig(conf Config) (ret Server, err error) {
 		// do not close over loop index
 		go func(w *Worker) {
 			defer func() {
-				ret.ConsumePanic(recover())
+				ConsumePanic(ret, recover())
 			}()
 			w.Work()
 		}(ret.Workers[i])
@@ -178,7 +189,7 @@ func NewFromConfig(conf Config) (ret Server, err error) {
 	conf.SentryDsn = "REDACTED"
 	log.WithField("config", conf).Debug("Initialized server")
 
-	if len(conf.TraceAddress) > 0 && len(conf.TraceAPIAddress) > 0 {
+	if len(conf.TraceAddress) > 0 && (conf.TraceAPIAddress != "") {
 
 		ret.TraceWorker = NewTraceWorker(ret.statsd)
 
@@ -242,6 +253,22 @@ func NewFromConfig(conf Config) (ret Server, err error) {
 	return
 }
 
+func (s Server) GetHostname() string {
+	return s.Hostname
+}
+
+func (s Server) GetSentry() *raven.Client {
+	return s.sentry
+}
+
+func (s Server) GetStats() *statsd.Client {
+	return s.statsd
+}
+
+func (s Server) GetHTTPClient() *http.Client {
+	return s.HTTPClient
+}
+
 // Start spins up the Server to do actual work, firing off goroutines for
 // various workers and utilities.
 func (s *Server) Start() {
@@ -250,7 +277,7 @@ func (s *Server) Start() {
 	go func() {
 		log.Info("Starting Event worker")
 		defer func() {
-			s.ConsumePanic(recover())
+			ConsumePanic(s, recover())
 		}()
 		s.EventWorker.Work()
 	}()
@@ -259,7 +286,7 @@ func (s *Server) Start() {
 		log.Info("Starting Trace worker")
 		go func() {
 			defer func() {
-				s.ConsumePanic(recover())
+				ConsumePanic(s, recover())
 			}()
 			s.TraceWorker.Work()
 		}()
@@ -281,7 +308,7 @@ func (s *Server) Start() {
 	for i := 0; i < s.numReaders; i++ {
 		go func() {
 			defer func() {
-				s.ConsumePanic(recover())
+				ConsumePanic(s, recover())
 			}()
 			s.ReadMetricSocket(packetPool, s.numReaders != 1)
 		}()
@@ -290,7 +317,7 @@ func (s *Server) Start() {
 	// Read Traces Forever!
 	go func() {
 		defer func() {
-			s.ConsumePanic(recover())
+			ConsumePanic(s, recover())
 		}()
 		if s.TraceAddr != nil {
 			s.ReadTraceSocket(tracePool, s.numReaders != 1)
@@ -302,14 +329,13 @@ func (s *Server) Start() {
 	// Flush every Interval forever!
 	go func() {
 		defer func() {
-			s.ConsumePanic(recover())
+			ConsumePanic(s, recover())
 		}()
 		ticker := time.NewTicker(s.interval)
 		for range ticker.C {
 			s.Flush()
 		}
 	}()
-
 }
 
 // HandleMetricPacket processes each packet that is sent to the server, and sends to an
@@ -458,6 +484,7 @@ func (s *Server) ReadTraceSocket(packetPool *sync.Pool, reuseport bool) {
 
 // HTTPServe starts the HTTP server and listens perpetually until it encounters an unrecoverable error.
 func (s *Server) HTTPServe() {
+
 	var prf interface {
 		Stop()
 	}

@@ -26,17 +26,17 @@ tags:
  - "baz:quz"
 udp_address: "localhost:8126"
 #http_address: "einhorn@0"
-http_address: "localhost:8127"
+http_address: ""
 
 ### FORWARDING
 # Use a static host for forwarding
-forward_address: "http://veneur.example.com"
+forward_address: "http://127.0.0.1:8127"
 
 ### TRACING
 # The address on which we will listen for trace data
-trace_address: "127.0.0.1:8128"
+#trace_address: "127.0.0.1:8128"
 # Use a static host to send traces to
-trace_api_address: "http://localhost:7777"
+#trace_api_address: "http://localhost:7777"
 
 sentry_dsn: ""
 
@@ -52,6 +52,6 @@ aws_region: ""
 aws_s3_bucket: ""
 
 # Influde these if you want write to InfluxDB
-influx_address: http://localhost:8086
-influx_consistency: one
-influx_db_name: mydb
+# influx_address: http://localhost:8086
+# influx_consistency: one
+# influx_db_name: mydb

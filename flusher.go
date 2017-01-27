@@ -333,7 +333,7 @@ func finalizeMetrics(hostname string, tags []string, finalMetrics []samplers.DDM
 // flushPart flushes a set of metrics to the remote API server
 func (s *Server) flushPart(metricSlice []samplers.DDMetric, wg *sync.WaitGroup) {
 	defer wg.Done()
-	s.postHelper(context.TODO(), fmt.Sprintf("%s/api/v1/series?api_key=%s", s.DDHostname, s.DDAPIKey), map[string][]samplers.DDMetric{
+	postHelper(context.TODO(), s, fmt.Sprintf("%s/api/v1/series?api_key=%s", s.DDHostname, s.DDAPIKey), map[string][]samplers.DDMetric{
 		"series": metricSlice,
 	}, "flush", true)
 }
@@ -421,7 +421,7 @@ func (s *Server) flushForward(wms []WorkerMetrics) {
 
 	// the error has already been logged (if there was one), so we only care
 	// about the success case
-	if s.postHelper(context.TODO(), endpoint, jsonMetrics, "forward", true) == nil {
+	if postHelper(context.TODO(), s, endpoint, jsonMetrics, "forward", true) == nil {
 		log.WithField("metrics", len(jsonMetrics)).Info("Completed forward to upstream Veneur")
 	}
 }
@@ -518,7 +518,7 @@ func (s *Server) flushTraces(ctx context.Context) {
 		// another curious constraint of this endpoint is that it does not
 		// support "Content-Encoding: deflate"
 
-		err := s.postHelper(span.Attach(ctx), fmt.Sprintf("%s/spans", s.DDTraceAddress), finalTraces, "flush_traces", false)
+		err := postHelper(span.Attach(ctx), s, fmt.Sprintf("%s/spans", s.DDTraceAddress), finalTraces, "flush_traces", false)
 
 		if err == nil {
 			log.WithField("traces", len(finalTraces)).Info("Completed flushing traces to Datadog")
@@ -557,7 +557,7 @@ func (s *Server) flushEventsChecks() {
 		// the official dd-agent
 		// we don't actually pass all the body keys that dd-agent passes here... but
 		// it still works
-		err := s.postHelper(context.TODO(), fmt.Sprintf("%s/intake?api_key=%s", s.DDHostname, s.DDAPIKey), map[string]map[string][]samplers.UDPEvent{
+		err := postHelper(context.TODO(), s, fmt.Sprintf("%s/intake?api_key=%s", s.DDHostname, s.DDAPIKey), map[string]map[string][]samplers.UDPEvent{
 			"events": {
 				"api": events,
 			},
@@ -571,7 +571,7 @@ func (s *Server) flushEventsChecks() {
 		// this endpoint is not documented to take an array... but it does
 		// another curious constraint of this endpoint is that it does not
 		// support "Content-Encoding: deflate"
-		err := s.postHelper(context.TODO(), fmt.Sprintf("%s/api/v1/check_run?api_key=%s", s.DDHostname, s.DDAPIKey), checks, "flush_checks", false)
+		err := postHelper(context.TODO(), s, fmt.Sprintf("%s/api/v1/check_run?api_key=%s", s.DDHostname, s.DDAPIKey), checks, "flush_checks", false)
 		if err == nil {
 			log.WithField("checks", len(checks)).Info("Completed flushing service checks to Datadog")
 		}
@@ -584,7 +584,7 @@ func (s *Server) flushEventsChecks() {
 // this function - probably a static string for each callsite
 // you can disable compression with compress=false for endpoints that don't
 // support it
-func (s *Server) postHelper(ctx context.Context, endpoint string, bodyObject interface{}, action string, compress bool) error {
+func postHelper(ctx context.Context, s VeneurServer, endpoint string, bodyObject interface{}, action string, compress bool) error {
 	span, _ := trace.StartSpanFromContext(ctx, action, trace.NameTag("veneur.opentracing.flush.postHelper"))
 	defer span.Finish()
 
@@ -604,29 +604,29 @@ func (s *Server) postHelper(ctx context.Context, endpoint string, bodyObject int
 		encoder = json.NewEncoder(&bodyBuffer)
 	}
 	if err := encoder.Encode(bodyObject); err != nil {
-		s.statsd.Count(action+".error_total", 1, []string{"cause:json"}, 1.0)
+		s.GetStats().Count(action+".error_total", 1, []string{"cause:json"}, 1.0)
 		innerLogger.WithError(err).Error("Could not render JSON")
 		return err
 	}
 	if compress {
 		// don't forget to flush leftover compressed bytes to the buffer
 		if err := compressor.Close(); err != nil {
-			s.statsd.Count(action+".error_total", 1, []string{"cause:compress"}, 1.0)
+			s.GetStats().Count(action+".error_total", 1, []string{"cause:compress"}, 1.0)
 			innerLogger.WithError(err).Error("Could not finalize compression")
 			return err
 		}
 	}
-	s.statsd.TimeInMilliseconds(action+".duration_ns", float64(time.Since(marshalStart).Nanoseconds()), []string{"part:json"}, 1.0)
+	s.GetStats().TimeInMilliseconds(action+".duration_ns", float64(time.Since(marshalStart).Nanoseconds()), []string{"part:json"}, 1.0)
 
 	// Len reports the unread length, so we have to record this before the
 	// http client consumes it
 	bodyLength := bodyBuffer.Len()
-	s.statsd.Histogram(action+".content_length_bytes", float64(bodyLength), nil, 1.0)
+	s.GetStats().Histogram(action+".content_length_bytes", float64(bodyLength), nil, 1.0)
 
 	req, err := http.NewRequest(http.MethodPost, endpoint, &bodyBuffer)
 
 	if err != nil {
-		s.statsd.Count(action+".error_total", 1, []string{"cause:construct"}, 1.0)
+		s.GetStats().Count(action+".error_total", 1, []string{"cause:construct"}, 1.0)
 		innerLogger.WithError(err).Error("Could not construct request")
 		return err
 	}
@@ -639,30 +639,30 @@ func (s *Server) postHelper(ctx context.Context, endpoint string, bodyObject int
 
 	err = tracer.InjectRequest(span.Trace, req)
 	if err != nil {
-		s.statsd.Count("veneur.opentracing.flush.inject.errors", 1, nil, 1.0)
+		s.GetStats().Count("veneur.opentracing.flush.inject.errors", 1, nil, 1.0)
 		innerLogger.WithError(err).Error("Error injecting header")
 	}
 
 	requestStart := time.Now()
-	resp, err := s.HTTPClient.Do(req)
+	resp, err := s.GetHTTPClient().Do(req)
 	if err != nil {
 		if urlErr, ok := err.(*url.Error); ok {
 			// if the error has the url in it, then retrieve the inner error
 			// and ditch the url (which might contain secrets)
 			err = urlErr.Err
 		}
-		s.statsd.Count(action+".error_total", 1, []string{"cause:io"}, 1.0)
+		s.GetStats().Count(action+".error_total", 1, []string{"cause:io"}, 1.0)
 		innerLogger.WithError(err).Error("Could not execute request")
 		return err
 	}
-	s.statsd.TimeInMilliseconds(action+".duration_ns", float64(time.Since(requestStart).Nanoseconds()), []string{"part:post"}, 1.0)
+	s.GetStats().TimeInMilliseconds(action+".duration_ns", float64(time.Since(requestStart).Nanoseconds()), []string{"part:post"}, 1.0)
 	defer resp.Body.Close()
 
 	responseBody, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		// this error is not fatal, since we only need the body for reporting
 		// purposes
-		s.statsd.Count(action+".error_total", 1, []string{"cause:readresponse"}, 1.0)
+		s.GetStats().Count(action+".error_total", 1, []string{"cause:readresponse"}, 1.0)
 		innerLogger.WithError(err).Error("Could not read response body")
 	}
 	resultLogger := innerLogger.WithFields(logrus.Fields{
@@ -674,13 +674,13 @@ func (s *Server) postHelper(ctx context.Context, endpoint string, bodyObject int
 	})
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		s.statsd.Count(action+".error_total", 1, []string{fmt.Sprintf("cause:%d", resp.StatusCode)}, 1.0)
+		s.GetStats().Count(action+".error_total", 1, []string{fmt.Sprintf("cause:%d", resp.StatusCode)}, 1.0)
 		resultLogger.Error("Could not POST")
 		return err
 	}
 
 	// make sure the error metric isn't sparse
-	s.statsd.Count(action+".error_total", 0, nil, 1.0)
+	s.GetStats().Count(action+".error_total", 0, nil, 1.0)
 	resultLogger.Debug("POSTed successfully")
 	return nil
 }
